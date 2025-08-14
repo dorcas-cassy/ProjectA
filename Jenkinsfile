@@ -3,115 +3,86 @@ pipeline {
 
   options {
     timestamps()
-    ansiColor('xterm')
   }
 
+  // Use the Maven you added in Manage Jenkins → Tools (you named it "M3")
   tools {
-    maven 'M3'   // Manage Jenkins -> Tools -> Maven installations -> Name = M3
+    maven 'M3'
   }
 
   environment {
-    // --- Repo info (informational) ---
-    REPO   = 'https://github.com/dorcas-cassy/ProjectA.git'
-    BRANCH = 'main'
-
-    // --- Tomcat info ---
+    // --- Tomcat info (Jenkins in Docker on Mac -> use host.docker.internal) ---
     TOMCAT_URL = 'http://host.docker.internal:8080'
-    APP_NAME   = 'helloworld'    // context path -> http://localhost:8080/helloworld/
-
-    // Filled after build
-    WAR_FILE = ''
+    APP_NAME   = 'helloworld'     // the context path -> http://localhost:8080/helloworld/
+    WAR_FILE   = ''               // will be filled after build
   }
 
   stages {
-
     stage('Checkout') {
       steps {
-        // If you configured "Pipeline script from SCM", Jenkins will check out automatically.
-        // This fallback checkout helps when the job uses inline pipeline script.
-        checkout([
-          $class: 'GitSCM',
-          branches: [[name: "*/${env.BRANCH}"]],
-          userRemoteConfigs: [[url: env.REPO]]
-        ])
+        // If your job is "Pipeline script" (not from SCM), use this:
+        git url: 'https://github.com/dorcas-cassy/ProjectA.git', branch: 'main'
+        // If your job already uses "Pipeline script from SCM", you can remove the line above.
       }
     }
 
     stage('Build WAR') {
       steps {
         script {
-          // Build with Maven (skip tests for speed)
-          sh '''
-            echo '--- DEBUG: Java / Maven versions ---'
-            java -version || true
-            mvn -v || true
-          '''
+          // Ensure this is a Maven project
+          if (!fileExists('pom.xml')) {
+            error "No pom.xml found at workspace root -> cannot build WAR."
+          }
+
+          // Build
           sh 'mvn -B -DskipTests clean package'
 
-          // 1) Standard Maven output directory
-          def warCandidate = sh(returnStdout: true,
-            script: "ls -1 target/*.war 2>/dev/null | head -n 1"
+          // Find the WAR produced by the build
+          env.WAR_FILE = sh(
+            script: "ls -1 target/*.war 2>/dev/null | head -n 1",
+            returnStdout: true
           ).trim()
 
-          // 2) Fallback – search the workspace just in case
-          if (!warCandidate) {
-            warCandidate = sh(returnStdout: true,
-              script: "find . -maxdepth 4 -type f -name '*.war' -not -path './.git/*' | head -n 1"
-            ).trim()
+          if (!env.WAR_FILE) {
+            // Give a helpful directory listing if nothing was found
+            sh 'echo "No WAR in target/. Contents:" && ls -al target || true'
+            error "WAR_FILE not set — build produced no WAR. Check Maven output and packaging."
           }
 
-          env.WAR_FILE = warCandidate
-          sh 'echo "--- DEBUG: WAR_FILE => ${WAR_FILE}"'
-
-          if (!env.WAR_FILE?.trim()) {
-            sh 'echo "--- DEBUG: listing target & build/libs ---"; ls -lah target || true; ls -lah build/libs || true'
-            error 'WAR_FILE not set — build produced no WAR.'
-          }
-
-          sh 'ls -lh "${WAR_FILE}"'
+          sh "echo 'WAR file found: ${env.WAR_FILE}' && ls -lh '${env.WAR_FILE}'"
         }
       }
     }
 
     stage('Deploy to Tomcat') {
       steps {
-        withCredentials([usernamePassword(
-          credentialsId: 'tomcat-creds',
-          usernameVariable: 'TOMCAT_USER',
-          passwordVariable: 'TOMCAT_PASS'
-        )]) {
-          script {
-            // (Re)deploy using Tomcat Manager text API
-            sh """
-              set -euo pipefail
+        withCredentials([
+          usernamePassword(
+            credentialsId: 'tomcat-creds',   // your Jenkins credential ID
+            usernameVariable: 'TOMCAT_USER',
+            passwordVariable: 'TOMCAT_PASS'
+          )
+        ]) {
+          sh """
+            set -euo pipefail
+            echo 'Undeploying old app (ignore error if not deployed yet)...'
+            curl -fsS -u "$TOMCAT_USER:$TOMCAT_PASS" \\
+              "${TOMCAT_URL}/manager/text/undeploy?path=/${APP_NAME}" || true
 
-              echo '--- Undeploying old ${APP_NAME} (ignore error if not present) ---'
-              curl -sS -u "${TOMCAT_USER}:${TOMCAT_PASS}" \\
-                   "${TOMCAT_URL}/manager/text/undeploy?path=/${APP_NAME}" || true
+            echo 'Deploying new WAR...'
+            curl -fsS -u "$TOMCAT_USER:$TOMCAT_PASS" \\
+              -T "${WAR_FILE}" \\
+              "${TOMCAT_URL}/manager/text/deploy?path=/${APP_NAME}&update=true"
 
-              echo '--- Deploying WAR to /${APP_NAME} ---'
-              # retry a couple of times in case Tomcat is busy
-              n=0
-              until [ \$n -ge 3 ]; do
-                curl -sSf -u "${TOMCAT_USER}:${TOMCAT_PASS}" \\
-                     -T "${WAR_FILE}" \\
-                     "${TOMCAT_URL}/manager/text/deploy?path=/${APP_NAME}&update=true" && break
-                n=\$((n+1))
-                echo "Deploy attempt \$n failed — retrying in 2s..."; sleep 2
-              done
-            """
-          }
+            echo '✅ Deploy request sent to Tomcat Manager.'
+          """
         }
       }
     }
   }
 
   post {
-    success {
-      echo "✅ Deployed ${env.APP_NAME} to ${env.TOMCAT_URL} (WAR=${env.WAR_FILE})"
-    }
-    failure {
-      echo "❌ Build/Deploy failed — check stage logs."
-    }
+    success { echo "✅ Deployed ${env.APP_NAME} to ${env.TOMCAT_URL} (WAR=${env.WAR_FILE})" }
+    failure { echo "❌ Build/Deploy failed — check stage logs above." }
   }
 }

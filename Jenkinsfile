@@ -3,19 +3,23 @@ pipeline {
 
   options {
     timestamps()
+    ansiColor('xterm')
   }
 
   tools {
-    maven 'M3'              // Manage Jenkins » Tools (your Maven install name)
+    // Manage Jenkins → Tools → Maven installations → Name: M3
+    maven 'M3'
   }
 
   environment {
-    REPO       = 'https://github.com/dorcas-cassy/ProjectA.git'
-    BRANCH     = 'main'
+    // --- Repo info ---
+    REPO   = 'https://github.com/dorcas-cassy/ProjectA.git'
+    BRANCH = 'main'
 
-    TOMCAT_URL = 'http://host.docker.internal:8080'   // Tomcat on host Mac
-    APP_NAME   = 'helloworld'                          // context path
-    WAR_FILE   = ''                                    // filled after build
+    // --- Tomcat info (Jenkins in Docker → Tomcat on Mac) ---
+    TOMCAT_URL = 'http://host.docker.internal:8080'
+    APP_NAME   = 'helloworld'   // context path -> http://localhost:8080/helloworld/
+    WAR_FILE   = ''
   }
 
   stages {
@@ -28,56 +32,57 @@ pipeline {
 
     stage('Build WAR') {
       steps {
-        // clean & build with Maven
+        // Clean build with Maven
         sh '''
-          rm -rf target
+          set -euxo pipefail
+          mvn -v
+          rm -rf target || true
           mvn -B -DskipTests clean package
         '''
 
+        // Find the generated WAR (be robust about the path)
         script {
-          // Prefer the WAR Maven puts in target/, else look elsewhere (last resort)
-          def found = sh(
+          env.WAR_FILE = sh(
             script: '''
-              set -e
-              if [ -d target ]; then
-                f=$(ls -1 target/*.war 2>/dev/null | head -n 1 || true)
+              # Prefer target/*.war at repo root
+              WAR=$(ls -1 target/*.war 2>/dev/null | head -n 1 || true)
+              if [ -z "$WAR" ]; then
+                # Fallback: look up to 3 levels deep but still prefer /target/
+                WAR=$(find . -maxdepth 3 -type f -name "*.war" | grep "/target/" | head -n 1 || true)
               fi
-              if [ -z "$f" ]; then
-                f=$(find . -maxdepth 3 -type f -name "*.war" | head -n 1 || true)
-              fi
-              echo "$f"
+              echo "$WAR"
             ''',
             returnStdout: true
           ).trim()
 
-          if (!found) {
-            error 'WAR_FILE not set — build produced no WAR.'
+          if (!env.WAR_FILE) {
+            error "WAR_FILE not set — build produced no WAR. Check that <packaging>war</packaging> is in pom.xml."
+          } else {
+            echo "WAR file found: ${env.WAR_FILE}"
+            sh "ls -lh ${env.WAR_FILE}"
           }
-          env.WAR_FILE = found
-          echo "WAR file found: ${env.WAR_FILE}"
         }
       }
     }
 
     stage('Deploy to Tomcat') {
       steps {
-        withCredentials([usernamePassword(
-          credentialsId: 'tomcat-creds',
-          usernameVariable: 'TOMCAT_USER',
-          passwordVariable: 'TOMCAT_PASS'
-        )]) {
-          sh """
+        withCredentials([
+          usernamePassword(credentialsId: 'tomcat-creds',
+                           usernameVariable: 'TOMCAT_USER',
+                           passwordVariable: 'TOMCAT_PASS')
+        ]) {
+          sh '''
             set -euo pipefail
+            echo "Undeploying old /${APP_NAME} (ignore error if not deployed yet)..."
+            curl -sS -u "${TOMCAT_USER}:${TOMCAT_PASS}" \
+                 "${TOMCAT_URL}/manager/text/undeploy?path=/${APP_NAME}" || true
 
-            # Undeploy old version (ignore if not present)
-            curl -fsS -u "$TOMCAT_USER:$TOMCAT_PASS" \
-              "${TOMCAT_URL}/manager/text/undeploy?path=/${APP_NAME}" || true
-
-            # Deploy new WAR
-            curl -fsS -u "$TOMCAT_USER:$TOMCAT_PASS" \
-              -T "${WAR_FILE}" \
-              "${TOMCAT_URL}/manager/text/deploy?path=/${APP_NAME}&update=true"
-          """
+            echo "Deploying ${WAR_FILE} to ${TOMCAT_URL} at /${APP_NAME} ..."
+            curl -sS -u "${TOMCAT_USER}:${TOMCAT_PASS}" \
+                 --upload-file "${WAR_FILE}" \
+                 "${TOMCAT_URL}/manager/text/deploy?path=/${APP_NAME}&update=true"
+          '''
         }
       }
     }
@@ -85,10 +90,10 @@ pipeline {
 
   post {
     success {
-      echo "✅ Deployed ${env.APP_NAME} to ${env.TOMCAT_URL} (WAR=${env.WAR_FILE})"
+      echo "✅ Deployed /${env.APP_NAME} to ${env.TOMCAT_URL}"
     }
     failure {
-      echo "❌ Build/Deploy failed — check stage logs."
+      echo "❌ Build/Deploy failed — check stage logs above."
     }
   }
 }

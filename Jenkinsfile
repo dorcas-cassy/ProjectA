@@ -1,32 +1,26 @@
 pipeline {
   agent any
-  options {
-    timestamps()
-    ansiColor('xterm')
-  }
+  options { timestamps() }
 
   tools {
-    maven 'M3'      // the Maven you added in Manage Jenkins > Tools
+    // Change this if your Maven tool name is different
+    maven 'M3'
   }
 
   environment {
-    // --- Repo info ---
-    REPO   = 'https://github.com/dorcas-cassy/ProjectA.git'
-    BRANCH = 'main'
-
-    // --- Tomcat info ---
-    // Jenkins is in Docker; Tomcat is on your Mac -> use host.docker.internal
+    // Tomcat info
     TOMCAT_URL = 'http://host.docker.internal:8080'
-    APP_NAME   = 'helloworld'     // the context path
+    APP_NAME   = 'helloworld'
 
-    // Filled after build
-    WAR_FILE = ''
+    // Will be set during build
+    WAR_FILE   = ''
   }
 
   stages {
     stage('Checkout') {
       steps {
-        git url: env.REPO, branch: env.BRANCH
+        // Uses the same SCM config as the job
+        checkout scm
       }
     }
 
@@ -35,13 +29,27 @@ pipeline {
         script {
           if (fileExists('pom.xml')) {
             sh 'mvn -B -DskipTests clean package'
-            env.WAR_FILE = sh(script: "ls target/*.war | head -n1", returnStdout: true).trim()
-          } else if (fileExists('build.gradle')) {
-            sh './gradlew clean war -x test'
-            env.WAR_FILE = sh(script: "ls build/libs/*.war | head -n1", returnStdout: true).trim()
+            env.WAR_FILE = sh(
+              script: "ls -1 target/*.war | head -n 1",
+              returnStdout: true
+            ).trim()
+          } else if (fileExists('build.gradle') || fileExists('build.gradle.kts')) {
+            // Prefer wrapper; fall back to system gradle if needed
+            sh 'chmod +x gradlew || true'
+            sh './gradlew clean build -x test || gradle clean build -x test'
+            env.WAR_FILE = sh(
+              script: "ls -1 build/libs/*.war | head -n 1",
+              returnStdout: true
+            ).trim()
           } else {
-            error 'No pom.xml or build.gradle found — cannot build WAR'
+            error 'No pom.xml or Gradle build file found — cannot build WAR.'
           }
+
+          if (!env.WAR_FILE?.trim()) {
+            error 'WAR_FILE not set — build produced no WAR.'
+          }
+          sh "ls -lh '${env.WAR_FILE}'"
+          echo "WAR file found: ${env.WAR_FILE}"
         }
       }
     }
@@ -49,17 +57,18 @@ pipeline {
     stage('Deploy to Tomcat') {
       steps {
         withCredentials([usernamePassword(
-          credentialsId: 'tomcat-creds',  // you already created this
+          credentialsId: 'tomcat-creds',
           usernameVariable: 'TOMCAT_USER',
           passwordVariable: 'TOMCAT_PASS'
         )]) {
           sh """
-            # undeploy (ignore failure if not deployed yet)
-            curl -sS -u "$TOMCAT_USER:$TOMCAT_PASS" \
+            set -euo pipefail
+            # Undeploy old version (ignore if not present)
+            curl -fsS -u "$TOMCAT_USER:$TOMCAT_PASS" \
               "${TOMCAT_URL}/manager/text/undeploy?path=/${APP_NAME}" || true
 
-            # deploy new WAR
-            curl -sS -f -u "$TOMCAT_USER:$TOMCAT_PASS" \
+            # Deploy new WAR
+            curl -fsS -u "$TOMCAT_USER:$TOMCAT_PASS" \
               -T "${WAR_FILE}" \
               "${TOMCAT_URL}/manager/text/deploy?path=/${APP_NAME}&update=true"
           """
@@ -69,7 +78,11 @@ pipeline {
   }
 
   post {
-    success { echo "✅ Deployed ${env.APP_NAME} to ${env.TOMCAT_URL}" }
-    failure { echo "❌ Build/Deploy failed — check stage logs." }
+    success {
+      echo "✅ Deployed /${env.APP_NAME} to ${env.TOMCAT_URL} (WAR=${env.WAR_FILE})"
+    }
+    failure {
+      echo "❌ Build/Deploy failed — check stage logs."
+    }
   }
 }

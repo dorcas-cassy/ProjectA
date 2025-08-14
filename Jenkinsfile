@@ -25,64 +25,41 @@ pipeline {
     }
 
     stage('Build WAR') {
-      steps {
-        script {
-          if (fileExists('pom.xml')) {
-            sh 'mvn -B -DskipTests clean package'
-            env.WAR_FILE = sh(
-              script: "ls -1 target/*.war | head -n 1",
-              returnStdout: true
-            ).trim()
-          } else if (fileExists('build.gradle') || fileExists('build.gradle.kts')) {
-            // Prefer wrapper; fall back to system gradle if needed
-            sh 'chmod +x gradlew || true'
-            sh './gradlew clean build -x test || gradle clean build -x test'
-            env.WAR_FILE = sh(
-              script: "ls -1 build/libs/*.war | head -n 1",
-              returnStdout: true
-            ).trim()
-          } else {
-            error 'No pom.xml or Gradle build file found — cannot build WAR.'
-          }
+  steps {
+    script {
+      sh """
+        echo '--- DEBUG: Maven version ---'
+        mvn -v || true
+        echo '--- DEBUG: Top-level tree ---'
+        ls -lah || true
+      """
 
-          if (!env.WAR_FILE?.trim()) {
-            error 'WAR_FILE not set — build produced no WAR.'
-          }
-          sh "ls -lh '${env.WAR_FILE}'"
-          echo "WAR file found: ${env.WAR_FILE}"
-        }
+      if (fileExists('pom.xml')) {
+        sh 'mvn -B -DskipTests clean package'
+      } else if (fileExists('build.gradle') || fileExists('build.gradle.kts')) {
+        sh '''
+          chmod +x gradlew || true
+          ./gradlew clean build -x test || gradle clean build -x test
+        '''
+      } else {
+        error 'No pom.xml or Gradle build file found — cannot build WAR.'
       }
-    }
 
-    stage('Deploy to Tomcat') {
-      steps {
-        withCredentials([usernamePassword(
-          credentialsId: 'tomcat-creds',
-          usernameVariable: 'TOMCAT_USER',
-          passwordVariable: 'TOMCAT_PASS'
-        )]) {
-          sh """
-            set -euo pipefail
-            # Undeploy old version (ignore if not present)
-            curl -fsS -u "$TOMCAT_USER:$TOMCAT_PASS" \
-              "${TOMCAT_URL}/manager/text/undeploy?path=/${APP_NAME}" || true
+      // Robust WAR locator: search a few levels deep, ignore .git
+      env.WAR_FILE = sh(
+        script: "find . -maxdepth 4 -type f -name '*.war' -not -path './.git/*' | head -n 1",
+        returnStdout: true
+      ).trim()
 
-            # Deploy new WAR
-            curl -fsS -u "$TOMCAT_USER:$TOMCAT_PASS" \
-              -T "${WAR_FILE}" \
-              "${TOMCAT_URL}/manager/text/deploy?path=/${APP_NAME}&update=true"
-          """
-        }
+      sh 'echo "--- DEBUG: found WAR => ${WAR_FILE}"'
+
+      if (!env.WAR_FILE?.trim()) {
+        sh 'echo "--- DEBUG: listing build dirs ---"; ls -lah target || true; ls -lah build/libs || true'
+        error 'WAR_FILE not set — build produced no WAR.'
       }
-    }
-  }
 
-  post {
-    success {
-      echo "✅ Deployed /${env.APP_NAME} to ${env.TOMCAT_URL} (WAR=${env.WAR_FILE})"
-    }
-    failure {
-      echo "❌ Build/Deploy failed — check stage logs."
+      sh 'ls -lh "${WAR_FILE}"'
+      echo "WAR file found: ${env.WAR_FILE}"
     }
   }
 }

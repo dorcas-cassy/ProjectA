@@ -6,68 +6,69 @@ pipeline {
     ansiColor('xterm')
   }
 
-  // Make sure you have a Maven tool named "M3" in Manage Jenkins > Tools
   tools {
-    maven 'M3'
+    maven 'M3'   // Manage Jenkins -> Tools -> Maven installations -> Name = M3
   }
 
   environment {
-    // --- Tomcat info (Jenkins-in-Docker -> Tomcat-on-Mac) ---
+    // --- Repo info (informational) ---
+    REPO   = 'https://github.com/dorcas-cassy/ProjectA.git'
+    BRANCH = 'main'
+
+    // --- Tomcat info ---
     TOMCAT_URL = 'http://host.docker.internal:8080'
-    APP_NAME   = 'helloworld'   // context path -> http://localhost:8080/helloworld/
-    // Will be set during build:
-    WAR_FILE   = ''
+    APP_NAME   = 'helloworld'    // context path -> http://localhost:8080/helloworld/
+
+    // Filled after build
+    WAR_FILE = ''
   }
 
   stages {
 
     stage('Checkout') {
       steps {
-        // Because this Jenkinsfile is in the repo, SCM config in the job supplies 'scm'
-        checkout scm
+        // If you configured "Pipeline script from SCM", Jenkins will check out automatically.
+        // This fallback checkout helps when the job uses inline pipeline script.
+        checkout([
+          $class: 'GitSCM',
+          branches: [[name: "*/${env.BRANCH}"]],
+          userRemoteConfigs: [[url: env.REPO]]
+        ])
       }
     }
 
     stage('Build WAR') {
       steps {
         script {
-          // Some quick debug so we see what's going on if something fails
-          sh """
-            echo '--- DEBUG: Java & Maven ---'
+          // Build with Maven (skip tests for speed)
+          sh '''
+            echo '--- DEBUG: Java / Maven versions ---'
             java -version || true
-            mvn  -v      || true
-            echo '--- DEBUG: Workspace top-level ---'
-            ls -lah || true
-          """
+            mvn -v || true
+          '''
+          sh 'mvn -B -DskipTests clean package'
 
-          if (fileExists('pom.xml')) {
-            // Maven build
-            sh 'mvn -B -DskipTests clean package'
-          } else if (fileExists('build.gradle') || fileExists('build.gradle.kts')) {
-            // Gradle build (wrapper preferred, falls back to system gradle)
-            sh '''
-              chmod +x gradlew || true
-              ./gradlew clean build -x test || gradle clean build -x test
-            '''
-          } else {
-            error 'No pom.xml or Gradle build file found — cannot build WAR.'
-          }
-
-          // Robust WAR locator: search a few levels deep, ignore .git
-          env.WAR_FILE = sh(
-            script: "find . -maxdepth 4 -type f -name '*.war' -not -path './.git/*' | head -n 1",
-            returnStdout: true
+          // 1) Standard Maven output directory
+          def warCandidate = sh(returnStdout: true,
+            script: "ls -1 target/*.war 2>/dev/null | head -n 1"
           ).trim()
 
-          sh 'echo "--- DEBUG: found WAR => ${WAR_FILE}"'
+          // 2) Fallback – search the workspace just in case
+          if (!warCandidate) {
+            warCandidate = sh(returnStdout: true,
+              script: "find . -maxdepth 4 -type f -name '*.war' -not -path './.git/*' | head -n 1"
+            ).trim()
+          }
+
+          env.WAR_FILE = warCandidate
+          sh 'echo "--- DEBUG: WAR_FILE => ${WAR_FILE}"'
 
           if (!env.WAR_FILE?.trim()) {
-            sh 'echo "--- DEBUG: listing common build dirs ---"; ls -lah target || true; ls -lah build/libs || true'
+            sh 'echo "--- DEBUG: listing target & build/libs ---"; ls -lah target || true; ls -lah build/libs || true'
             error 'WAR_FILE not set — build produced no WAR.'
           }
 
           sh 'ls -lh "${WAR_FILE}"'
-          echo "WAR file found: ${env.WAR_FILE}"
         }
       }
     }
@@ -79,17 +80,27 @@ pipeline {
           usernameVariable: 'TOMCAT_USER',
           passwordVariable: 'TOMCAT_PASS'
         )]) {
-          sh '''
-            set -euo pipefail
-            echo "--- Undeploying old version (if present) ---"
-            curl -fsS -u "$TOMCAT_USER:$TOMCAT_PASS" \
-              "$TOMCAT_URL/manager/text/undeploy?path=/${APP_NAME}" || true
+          script {
+            // (Re)deploy using Tomcat Manager text API
+            sh """
+              set -euo pipefail
 
-            echo "--- Deploying ${APP_NAME} from ${WAR_FILE} ---"
-            curl -fsS -u "$TOMCAT_USER:$TOMCAT_PASS" \
-              -T "$WAR_FILE" \
-              "$TOMCAT_URL/manager/text/deploy?path=/${APP_NAME}&update=true"
-          '''
+              echo '--- Undeploying old ${APP_NAME} (ignore error if not present) ---'
+              curl -sS -u "${TOMCAT_USER}:${TOMCAT_PASS}" \\
+                   "${TOMCAT_URL}/manager/text/undeploy?path=/${APP_NAME}" || true
+
+              echo '--- Deploying WAR to /${APP_NAME} ---'
+              # retry a couple of times in case Tomcat is busy
+              n=0
+              until [ \$n -ge 3 ]; do
+                curl -sSf -u "${TOMCAT_USER}:${TOMCAT_PASS}" \\
+                     -T "${WAR_FILE}" \\
+                     "${TOMCAT_URL}/manager/text/deploy?path=/${APP_NAME}&update=true" && break
+                n=\$((n+1))
+                echo "Deploy attempt \$n failed — retrying in 2s..."; sleep 2
+              done
+            """
+          }
         }
       }
     }

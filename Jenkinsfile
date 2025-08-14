@@ -1,64 +1,94 @@
-pipeline {
-    agent any
+   pipeline {
+  agent any
 
-    tools {
-        maven 'M3'
-        jdk 'JDK17'
+  options {
+    timestamps()
+  }
+
+  tools {
+    maven 'M3'              // Manage Jenkins » Tools (your Maven install name)
+  }
+
+  environment {
+    REPO       = 'https://github.com/dorcas-cassy/ProjectA.git'
+    BRANCH     = 'main'
+
+    TOMCAT_URL = 'http://host.docker.internal:8080'   // Tomcat on host Mac
+    APP_NAME   = 'helloworld'                          // context path
+    WAR_FILE   = ''                                    // filled after build
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+        git url: env.REPO, branch: env.BRANCH
+      }
     }
 
-    environment {
-        WAR_FILE = ''
-        TOMCAT_USER = 'admin'
-        TOMCAT_PASS = 'admin'
-        TOMCAT_HOST = 'localhost'
-        TOMCAT_PORT = '8080'
+    stage('Build WAR') {
+      steps {
+        // clean & build with Maven
+        sh '''
+          rm -rf target
+          mvn -B -DskipTests clean package
+        '''
+
+        script {
+          // Prefer the WAR Maven puts in target/, else look elsewhere (last resort)
+          def found = sh(
+            script: '''
+              set -e
+              if [ -d target ]; then
+                f=$(ls -1 target/*.war 2>/dev/null | head -n 1 || true)
+              fi
+              if [ -z "$f" ]; then
+                f=$(find . -maxdepth 3 -type f -name "*.war" | head -n 1 || true)
+              fi
+              echo "$f"
+            ''',
+            returnStdout: true
+          ).trim()
+
+          if (!found) {
+            error 'WAR_FILE not set — build produced no WAR.'
+          }
+          env.WAR_FILE = found
+          echo "WAR file found: ${env.WAR_FILE}"
+        }
+      }
     }
 
-    stages {
-        stage('Checkout') {
-            steps {
-                git branch: 'main', url: 'https://github.com/dorcas-cassy/ProjectA.git'
-            }
-        }
+    stage('Deploy to Tomcat') {
+      steps {
+        withCredentials([usernamePassword(
+          credentialsId: 'tomcat-creds',
+          usernameVariable: 'TOMCAT_USER',
+          passwordVariable: 'TOMCAT_PASS'
+        )]) {
+          sh """
+            set -euo pipefail
 
-        stage('Build WAR') {
-            steps {
-                sh 'mvn -B -DskipTests clean package'
+            # Undeploy old version (ignore if not present)
+            curl -fsS -u "$TOMCAT_USER:$TOMCAT_PASS" \
+              "${TOMCAT_URL}/manager/text/undeploy?path=/${APP_NAME}" || true
 
-                script {
-                    // Look for the WAR file
-                    WAR_FILE = sh(script: "find target -name '*.war' | head -n 1", returnStdout: true).trim()
-                    if (!WAR_FILE) {
-                        error "WAR_FILE not set – build produced no WAR"
-                    } else {
-                        echo "WAR file found: ${WAR_FILE}"
-                    }
-                }
-            }
+            # Deploy new WAR
+            curl -fsS -u "$TOMCAT_USER:$TOMCAT_PASS" \
+              -T "${WAR_FILE}" \
+              "${TOMCAT_URL}/manager/text/deploy?path=/${APP_NAME}&update=true"
+          """
         }
-
-        stage('Deploy to Tomcat') {
-            steps {
-                script {
-                    if (!WAR_FILE) {
-                        error "No WAR file to deploy"
-                    }
-                    sh """
-                        curl -u ${TOMCAT_USER}:${TOMCAT_PASS} \\
-                        --upload-file ${WAR_FILE} \\
-                        "http://${TOMCAT_HOST}:${TOMCAT_PORT}/manager/text/deploy?path=/myapp&update=true"
-                    """
-                }
-            }
-        }
+      }
     }
+  }
 
-    post {
-        success {
-            echo "Deployment successful!"
-        }
-        failure {
-            echo "Build/Deploy failed — check logs."
-        }
+  post {
+    success {
+      echo "✅ Deployed ${env.APP_NAME} to ${env.TOMCAT_URL} (WAR=${env.WAR_FILE})"
     }
+    failure {
+      echo "❌ Build/Deploy failed — check stage logs."
+    }
+  }
 }
